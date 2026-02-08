@@ -1,0 +1,11 @@
+.env
+__pycache__
+.venv/
+.pytest_cache/
+.mypy_cache/
+*.pyc
+data/
+reports/
+logs/
+cleo_bench.egg-info/
+uv.lock
