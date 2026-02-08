@@ -26,6 +26,10 @@ DEFAULT_MATH_KEY_ENV = "OPENROUTER_API_KEY_MATH"
 DEFAULT_JUDGE_KEY_ENV = "OPENROUTER_API_KEY_JUDGE"
 DEFAULT_REASONING_EFFORT = "high"
 DEFAULT_MAX_TOKENS = 65535
+DEFAULT_JUDGE_MAX_TOKENS = 8192
+DEFAULT_SAGEMATH_EVAL_TIMEOUT_SECONDS = 300.0
+DEFAULT_SOLVER_SAGEMATH_MCP_ARGS = ""
+DEFAULT_SOLVER_SAGEMATH_MCP_TOOLS = "evaluate_sage,calculate_expression"
 INTEGRAL_SUFFIX = "_integral"
 
 
@@ -81,6 +85,74 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_TOKENS,
         help="Max completion tokens for the solver model (set <=0 to omit).",
+    )
+    parser.add_argument(
+        "--judge-max-tokens",
+        type=int,
+        default=DEFAULT_JUDGE_MAX_TOKENS,
+        help="Max completion tokens for the judge model (set <=0 to omit).",
+    )
+    parser.add_argument(
+        "--judge-use-sagemath-mcp",
+        action="store_true",
+        help="Enable SageMath MCP tools for judge fallback scoring.",
+    )
+    parser.add_argument(
+        "--judge-sagemath-mcp-command",
+        default="sagemath-mcp",
+        help="Command used to launch the SageMath MCP server (when enabled).",
+    )
+    parser.add_argument(
+        "--judge-sagemath-mcp-args",
+        default="",
+        help="Comma-separated args for the SageMath MCP command.",
+    )
+    parser.add_argument(
+        "--solver-use-sagemath-mcp",
+        action="store_true",
+        help="Enable SageMath MCP tools for solver generation.",
+    )
+    parser.add_argument(
+        "--solver-require-sagemath-tool-call",
+        action="store_true",
+        help="Prompt solver to call at least one SageMath tool before final answer.",
+    )
+    parser.add_argument(
+        "--solver-sagemath-mcp-command",
+        default="sagemath-mcp",
+        help="Command used to launch the solver SageMath MCP server.",
+    )
+    parser.add_argument(
+        "--solver-sagemath-mcp-args",
+        default=DEFAULT_SOLVER_SAGEMATH_MCP_ARGS,
+        help="Comma-separated args for the solver SageMath MCP command.",
+    )
+    parser.add_argument(
+        "--solver-sagemath-mcp-tools",
+        default=DEFAULT_SOLVER_SAGEMATH_MCP_TOOLS,
+        help="Comma-separated SageMath tool names exposed to the solver.",
+    )
+    parser.add_argument(
+        "--solver-sagemath-tool-choice",
+        choices=("auto", "any", "none"),
+        default="auto",
+        help="Inspect tool_choice for solver-side SageMath tools.",
+    )
+    parser.add_argument(
+        "--sagemath-allow-imports",
+        action="store_true",
+        help="Enable import statements for both solver/judge SageMath MCP server processes.",
+    )
+    parser.add_argument(
+        "--sagemath-allowed-imports",
+        default="",
+        help="Optional comma-separated allowed imports for SageMath MCP when imports are enabled.",
+    )
+    parser.add_argument(
+        "--sagemath-eval-timeout-seconds",
+        type=float,
+        default=DEFAULT_SAGEMATH_EVAL_TIMEOUT_SECONDS,
+        help="Per Sage tool execution timeout in seconds for solver/judge MCP servers (set <=0 to disable override).",
     )
     parser.add_argument(
         "--show-tried",
@@ -180,6 +252,19 @@ def _build_inspect_command(
     judge_key_env: str,
     reasoning_effort: str,
     max_tokens: int,
+    judge_max_tokens: int,
+    judge_use_sagemath_mcp: bool,
+    judge_sagemath_mcp_command: str,
+    judge_sagemath_mcp_args: str,
+    solver_use_sagemath_mcp: bool,
+    solver_require_sagemath_tool_call: bool,
+    solver_sagemath_mcp_command: str,
+    solver_sagemath_mcp_args: str,
+    solver_sagemath_mcp_tools: str,
+    solver_sagemath_tool_choice: str,
+    sagemath_allow_imports: bool,
+    sagemath_allowed_imports: str,
+    sagemath_eval_timeout_seconds: float,
 ) -> str:
     lines = [
         f"OPENROUTER_API_KEY=\"${{{math_key_env}}}\" \\",
@@ -187,6 +272,7 @@ def _build_inspect_command(
         f"  --model {model} \\",
         f"  --model-base-url {base_url} \\",
         f"  -T judge_model={judge_model} \\",
+        f"  -T judge_api_key_env={judge_key_env} \\",
         ]
 
     if reasoning_effort.strip():
@@ -199,6 +285,49 @@ def _build_inspect_command(
 
     if max_tokens > 0:
         lines.append(f"  --max-tokens {max_tokens} \\")
+
+    if judge_max_tokens > 0:
+        lines.append(f"  -T judge_max_tokens={judge_max_tokens} \\")
+
+    if judge_use_sagemath_mcp:
+        lines.extend(
+            [
+                "  -T judge_use_sagemath_mcp=true \\",
+                f"  -T judge_sagemath_mcp_command={judge_sagemath_mcp_command} \\",
+            ]
+        )
+        if judge_sagemath_mcp_args.strip():
+            lines.append(f"  -T judge_sagemath_mcp_args={judge_sagemath_mcp_args} \\")
+        if sagemath_eval_timeout_seconds > 0:
+            lines.append(
+                f"  -T judge_sagemath_mcp_eval_timeout_seconds={float(sagemath_eval_timeout_seconds)} \\"
+            )
+        if sagemath_allow_imports:
+            lines.append("  -T judge_sagemath_mcp_allow_imports=true \\")
+            if sagemath_allowed_imports.strip():
+                lines.append(f"  -T judge_sagemath_mcp_allowed_imports={sagemath_allowed_imports} \\")
+
+    if solver_use_sagemath_mcp:
+        lines.extend(
+            [
+                "  -T solver_use_sagemath_mcp=true \\",
+                f"  -T solver_sagemath_mcp_command={solver_sagemath_mcp_command} \\",
+                f"  -T solver_sagemath_mcp_tools={solver_sagemath_mcp_tools} \\",
+                f"  -T solver_sagemath_tool_choice={solver_sagemath_tool_choice} \\",
+            ]
+        )
+        if solver_sagemath_mcp_args.strip():
+            lines.append(f"  -T solver_sagemath_mcp_args={solver_sagemath_mcp_args} \\")
+        if sagemath_eval_timeout_seconds > 0:
+            lines.append(
+                f"  -T solver_sagemath_mcp_eval_timeout_seconds={float(sagemath_eval_timeout_seconds)} \\"
+            )
+        if solver_require_sagemath_tool_call:
+            lines.append("  -T solver_require_sagemath_tool_call=true \\")
+        if sagemath_allow_imports:
+            lines.append("  -T solver_sagemath_mcp_allow_imports=true \\")
+            if sagemath_allowed_imports.strip():
+                lines.append(f"  -T solver_sagemath_mcp_allowed_imports={sagemath_allowed_imports} \\")
 
     lines.append(f"  -T dataset_file={dataset_path.as_posix()}")
     return "\n".join(lines)
@@ -295,6 +424,19 @@ def main() -> int:
         judge_key_env=args.judge_key_env,
         reasoning_effort=args.reasoning_effort,
         max_tokens=args.max_tokens,
+        judge_max_tokens=args.judge_max_tokens,
+        judge_use_sagemath_mcp=args.judge_use_sagemath_mcp,
+        judge_sagemath_mcp_command=args.judge_sagemath_mcp_command,
+        judge_sagemath_mcp_args=args.judge_sagemath_mcp_args,
+        solver_use_sagemath_mcp=args.solver_use_sagemath_mcp,
+        solver_require_sagemath_tool_call=args.solver_require_sagemath_tool_call,
+        solver_sagemath_mcp_command=args.solver_sagemath_mcp_command,
+        solver_sagemath_mcp_args=args.solver_sagemath_mcp_args,
+        solver_sagemath_mcp_tools=args.solver_sagemath_mcp_tools,
+        solver_sagemath_tool_choice=args.solver_sagemath_tool_choice,
+        sagemath_allow_imports=args.sagemath_allow_imports,
+        sagemath_allowed_imports=args.sagemath_allowed_imports,
+        sagemath_eval_timeout_seconds=args.sagemath_eval_timeout_seconds,
     )
     print("\nrun_command:")
     print(cmd)

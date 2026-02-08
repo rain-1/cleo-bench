@@ -11,7 +11,12 @@ from typing import Any
 import mpmath as mp
 
 from .constants import DEFAULT_DPS, DEFAULT_TOLERANCE
-from .judge import build_judge_prompt, run_judge_with_inspect
+from .judge import (
+    DEFAULT_JUDGE_MAX_TOKENS,
+    DEFAULT_SAGEMATH_MCP_EVAL_TIMEOUT_SECONDS,
+    build_judge_prompt,
+    run_judge_with_inspect,
+)
 from .numeric import abs_rel_close, evaluate_expression_numeric
 
 
@@ -40,16 +45,90 @@ def extract_candidate_expression(output_text: str) -> str | None:
     except json.JSONDecodeError:
         pass
 
-    # Best effort for JSON embedded in text.
-    match = re.search(r"\{[\s\S]*\}", raw)
-    if match:
+    def _candidate_from_obj(obj_text: str) -> str | None:
         try:
-            payload = json.loads(match.group(0))
-            value = payload.get("final_expression_latex") if isinstance(payload, dict) else None
+            payload = json.loads(obj_text)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(payload, dict):
+            value = payload.get("final_expression_latex")
             if isinstance(value, str) and value.strip():
                 return value.strip()
+        return None
+
+    def _json_object_spans(text: str) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        start: int | None = None
+        depth = 0
+        in_str = False
+        escape = False
+
+        for idx, ch in enumerate(text):
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+
+            if ch == '"':
+                in_str = True
+                continue
+
+            if ch == "{":
+                if depth == 0:
+                    start = idx
+                depth += 1
+                continue
+
+            if ch == "}":
+                if depth == 0:
+                    continue
+                depth -= 1
+                if depth == 0 and start is not None:
+                    spans.append((start, idx + 1))
+                    start = None
+        return spans
+
+    # Parse JSON code fences first if present.
+    for fence in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", raw, flags=re.IGNORECASE):
+        fenced = fence.group(1).strip()
+        candidate = _candidate_from_obj(fenced)
+        if candidate:
+            return candidate
+        for start, end in _json_object_spans(fenced):
+            if "final_expression_latex" not in fenced[start:end]:
+                continue
+            candidate = _candidate_from_obj(fenced[start:end])
+            if candidate:
+                return candidate
+
+    # Best effort for JSON objects embedded in prose.
+    for start, end in _json_object_spans(raw):
+        chunk = raw[start:end]
+        if "final_expression_latex" not in chunk:
+            continue
+        candidate = _candidate_from_obj(chunk)
+        if candidate:
+            return candidate
+
+    # Fallback: extract value from a key-value pair even if JSON is malformed.
+    kv_match = re.search(
+        r'"final_expression_latex"\s*:\s*"((?:\\.|[^"\\])*)"',
+        raw,
+        flags=re.DOTALL,
+    )
+    if kv_match:
+        encoded = kv_match.group(1)
+        try:
+            decoded = json.loads(f'"{encoded}"')
+            if isinstance(decoded, str) and decoded.strip():
+                return decoded.strip()
         except json.JSONDecodeError:
-            pass
+            if encoded.strip():
+                return encoded.strip()
 
     # Last fallback: parse boxed LaTeX.
     box = re.search(r"\\boxed\{([\s\S]+)\}", raw)
@@ -144,6 +223,18 @@ async def score_with_optional_judge(
     metadata: dict[str, Any],
     use_judge_when_unresolved: bool,
     judge_model: str | None,
+    judge_api_key: str | None = None,
+    judge_api_key_env: str | None = "OPENROUTER_API_KEY_JUDGE",
+    judge_max_tokens: int = DEFAULT_JUDGE_MAX_TOKENS,
+    judge_reasoning_effort: str | None = None,
+    judge_use_sagemath_mcp: bool = False,
+    judge_sagemath_mcp_command: str | None = None,
+    judge_sagemath_mcp_args: str | list[str] | tuple[str, ...] | None = None,
+    judge_sagemath_mcp_cwd: str | None = None,
+    judge_sagemath_mcp_tools: str | list[str] | tuple[str, ...] | None = None,
+    judge_sagemath_mcp_allow_imports: bool = False,
+    judge_sagemath_mcp_allowed_imports: str | list[str] | tuple[str, ...] | None = None,
+    judge_sagemath_mcp_eval_timeout_seconds: float | None = DEFAULT_SAGEMATH_MCP_EVAL_TIMEOUT_SECONDS,
     dps: int = DEFAULT_DPS,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> dict[str, Any]:
@@ -153,6 +244,10 @@ async def score_with_optional_judge(
         "numeric_error": det.numeric_error,
         "judge_used": False,
         "judge_scores": None,
+        "judge_error": None,
+        "judge_stop_reason": None,
+        "judge_tool_calls": None,
+        "judge_used_sagemath_mcp": None,
         "final_pass": det.final_pass,
         "final_score": det.final_score,
         "candidate_expression_latex": det.candidate_expression_latex,
@@ -172,11 +267,31 @@ async def score_with_optional_judge(
         integral_latex=metadata.get("integral_latex"),
         cleo_reference_latex=metadata.get("cleo_reference_latex"),
         accepted_reference_latex=metadata.get("accepted_reference_latex"),
+        allow_sagemath_tools=judge_use_sagemath_mcp,
     )
-    judge = await run_judge_with_inspect(prompt, model_name=judge_model)
+    judge = await run_judge_with_inspect(
+        prompt,
+        model_name=judge_model,
+        api_key=judge_api_key,
+        api_key_env=judge_api_key_env,
+        max_tokens=judge_max_tokens,
+        reasoning_effort=judge_reasoning_effort,
+        use_sagemath_mcp=judge_use_sagemath_mcp,
+        sagemath_mcp_command=judge_sagemath_mcp_command,
+        sagemath_mcp_args=judge_sagemath_mcp_args,
+        sagemath_mcp_cwd=judge_sagemath_mcp_cwd,
+        sagemath_mcp_tools=judge_sagemath_mcp_tools,
+        sagemath_mcp_allow_imports=judge_sagemath_mcp_allow_imports,
+        sagemath_mcp_allowed_imports=judge_sagemath_mcp_allowed_imports,
+        sagemath_mcp_eval_timeout_seconds=judge_sagemath_mcp_eval_timeout_seconds,
+    )
     result["judge_used"] = True
+    result["judge_stop_reason"] = judge.stop_reason
+    result["judge_tool_calls"] = judge.tool_calls
+    result["judge_used_sagemath_mcp"] = judge.used_sagemath_mcp
 
     if judge.error is not None:
+        result["judge_error"] = judge.error
         result["explanation"] = f"Judge fallback failed: {judge.error}"
         return result
 
@@ -194,6 +309,18 @@ def score_with_optional_judge_sync(
     metadata: dict[str, Any],
     use_judge_when_unresolved: bool,
     judge_model: str | None,
+    judge_api_key: str | None = None,
+    judge_api_key_env: str | None = "OPENROUTER_API_KEY_JUDGE",
+    judge_max_tokens: int = DEFAULT_JUDGE_MAX_TOKENS,
+    judge_reasoning_effort: str | None = None,
+    judge_use_sagemath_mcp: bool = False,
+    judge_sagemath_mcp_command: str | None = None,
+    judge_sagemath_mcp_args: str | list[str] | tuple[str, ...] | None = None,
+    judge_sagemath_mcp_cwd: str | None = None,
+    judge_sagemath_mcp_tools: str | list[str] | tuple[str, ...] | None = None,
+    judge_sagemath_mcp_allow_imports: bool = False,
+    judge_sagemath_mcp_allowed_imports: str | list[str] | tuple[str, ...] | None = None,
+    judge_sagemath_mcp_eval_timeout_seconds: float | None = DEFAULT_SAGEMATH_MCP_EVAL_TIMEOUT_SECONDS,
     dps: int = DEFAULT_DPS,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> dict[str, Any]:
@@ -203,6 +330,18 @@ def score_with_optional_judge_sync(
             metadata=metadata,
             use_judge_when_unresolved=use_judge_when_unresolved,
             judge_model=judge_model,
+            judge_api_key=judge_api_key,
+            judge_api_key_env=judge_api_key_env,
+            judge_max_tokens=judge_max_tokens,
+            judge_reasoning_effort=judge_reasoning_effort,
+            judge_use_sagemath_mcp=judge_use_sagemath_mcp,
+            judge_sagemath_mcp_command=judge_sagemath_mcp_command,
+            judge_sagemath_mcp_args=judge_sagemath_mcp_args,
+            judge_sagemath_mcp_cwd=judge_sagemath_mcp_cwd,
+            judge_sagemath_mcp_tools=judge_sagemath_mcp_tools,
+            judge_sagemath_mcp_allow_imports=judge_sagemath_mcp_allow_imports,
+            judge_sagemath_mcp_allowed_imports=judge_sagemath_mcp_allowed_imports,
+            judge_sagemath_mcp_eval_timeout_seconds=judge_sagemath_mcp_eval_timeout_seconds,
             dps=dps,
             tolerance=tolerance,
         )
